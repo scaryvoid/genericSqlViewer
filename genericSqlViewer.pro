@@ -28,10 +28,8 @@ SOURCES += main.cpp\
     connectdialog.cpp
 
 HEADERS  += mainwindow.h \
-    connectdialog.h \
-    waitingspinnerwidget.h
+    connectdialog.h
 
 FORMS    += mainwindow.ui \
     connectdialog.ui
 
-LIBS += -L$$PWD -lqtwaitingspinner

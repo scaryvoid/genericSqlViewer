@@ -10,6 +10,7 @@ MainWindow::MainWindow(QWidget *parent) :
     setupUi(this);
     ConnectDialog *dialog = new ConnectDialog;
     dialog->exec();
+    maxRows = 50000;
 
     // write settings to config file
     QSettings settings(QCoreApplication::applicationDirPath() + "/conf.ini", QSettings::IniFormat);
@@ -17,31 +18,29 @@ MainWindow::MainWindow(QWidget *parent) :
     settings.setValue("db", dialog->lineEditDatabase->text());
     settings.setValue("user", dialog->lineEditUser->text());
 
-    db.setHostName(dialog->lineEditHost->text());
-    db.setDatabaseName(dialog->lineEditDatabase->text());
-    db.setUserName(dialog->lineEditUser->text());
-    db.setPassword(dialog->lineEditPw->text());
+    QSqlDatabase *db = new QSqlDatabase(QSqlDatabase::addDatabase("QMYSQL"));
+    db->setHostName(dialog->lineEditHost->text());
+    db->setDatabaseName(dialog->lineEditDatabase->text());
+    db->setUserName(dialog->lineEditUser->text());
+    db->setPassword(dialog->lineEditPw->text());
 
     // bail if no connection
-    if(!db.open())
+    if(!db->open())
     {
-        QMessageBox::warning(this, "Error", "Unable to connect to database:" + db.lastError().text());
+        QMessageBox::warning(this, "Error", "Unable to connect to database:" + db->lastError().text());
         exit(1);
     }
 
-    model = new QSqlTableModel(this, db);
-
     // populate combobox table
     QSqlQuery queryTables("show tables");
-    int nTables = 0;
     while(queryTables.next())
-    {
         comboBox_Table->addItem(queryTables.value(0).toString());
-        nTables++;
-    }
 
     connect(lineEdit, SIGNAL(returnPressed()), this, SLOT(search()));
     connect(pbSearch, SIGNAL(clicked()), this, SLOT(search()));
+    connect(tableWidget, SIGNAL(itemChanged(QTableWidgetItem *)), this, SLOT(addToEditList()));
+
+    refresh("", "");
 }
 
 MainWindow::~MainWindow()
@@ -49,79 +48,115 @@ MainWindow::~MainWindow()
     delete ui;
 }
 
-void MainWindow::on_comboBox_Table_currentIndexChanged(const QString &table)
+void MainWindow::refresh(QString table, QString filter)
 {
-    model->setTable(table);
-    model->setEditStrategy(QSqlTableModel::OnManualSubmit);
-    QSqlQuery queryCount(QString("select count(*) from %1").arg(table));
-    int rowCount = 0;
-    while (queryCount.next())
-        rowCount = queryCount.value(0).toInt();
+    QApplication::setOverrideCursor(Qt::WaitCursor);
+    QSqlQuery contentQuery;
+    QSqlQuery nRowsQuery;
+    int tableRows;
+    editList.clear();
+    mapKeys.clear();
+    disconnect(tableWidget, SIGNAL(itemChanged(QTableWidgetItem *)), this, SLOT(addToEditList()));
 
-    if(rowCount > 50000)
-        sbWindow->showMessage(QString("Rows Limited"));
-    else
-        model->select();
+    // if no table, pick one
+    if(table.isEmpty())
+        table = comboBox_Table->currentText();
 
-    tableView->setModel(model);
-    tableView->resizeColumnsToContents();
-    tableView->show();
+    // get columns
+    QSqlQuery nColumnQuery(QString("select count(*) from information_schema.columns where table_name = '%1'").arg(table));
+    nColumnQuery.next();
+    int nColumns = nColumnQuery.value(0).toInt();
+    tableWidget->setColumnCount(nColumns);
 
-    // populate combobox_columns
-    comboBox_column->clear();
+    // populate column combo box
     QSqlQuery queryColumns(QString("desc %1").arg(table));
-    int nColumns = 0;
     while(queryColumns.next())
-    {
         comboBox_column->addItem(queryColumns.value(0).toString());
-        nColumns++;
+
+    // fill out header list
+    QStringList headerList;
+    QSqlQuery headerQuery(QString("select column_name from information_schema.columns where table_name='%1'").arg(table));
+    for(int header=0;header<nColumns;header++)
+    {
+        headerQuery.next();
+        headerList.append(headerQuery.value(0).toString());
     }
+    tableWidget->setHorizontalHeaderLabels(headerList);
+
+    // get primary key
+    QSqlQuery primaryKey(QString("select column_name from information_schema.key_column_usage where constraint_name='PRIMARY' and table_name='%1'").arg(table));
+    while(primaryKey.next())
+        mapKeys.insert(primaryKey.value(0).toString(), headerList.indexOf(primaryKey.value(0).toString()));
+
+    // get row count
+    if(filter.isEmpty())
+        nRowsQuery = QSqlQuery(QString("select count(*) from %1").arg(table));
+    else
+        nRowsQuery = QSqlQuery(QString("select count(*) %1").arg(filter));
+
+    // build query/set table up for nRows
+    nRowsQuery.next();
+    int nRows = nRowsQuery.value(0).toInt();
+    QList<QString> listKeys = mapKeys.keys();
+    if(nRows > maxRows)
+    {
+        if(filter.isEmpty())
+            contentQuery = QSqlQuery(QString("select * from %1 order by %2 limit %3").arg(table).arg(listKeys.join(',')).arg(maxRows));
+        else
+            contentQuery = QSqlQuery(QString("select * %1 order by %2 limit %3").arg(filter).arg(listKeys.join(',')).arg(maxRows));
+        sbWindow->showMessage(QString("Rows Limited"));
+        tableWidget->setRowCount(maxRows);
+        tableRows = maxRows;
+    }
+    else
+    {
+        if(filter.isEmpty())
+            contentQuery = QSqlQuery(QString("select * from %1 order by %2").arg(table).arg(listKeys.join(',')));
+        else
+            contentQuery = QSqlQuery(QString("select * %1 order by %2").arg(filter).arg(listKeys.join(',')));
+        tableWidget->setRowCount(nRows);
+        tableRows = nRows;
+        sbWindow->clearMessage();
+    }
+
+    // fill out cells
+    for(int row=0;row<tableRows;row++)
+    {
+        contentQuery.next();
+        for(int col=0;col<nColumns;col++)
+            tableWidget->setItem(row,col,new QTableWidgetItem(contentQuery.value(col).toString()));
+    }
+    tableWidget->resizeColumnsToContents();
+    QApplication::restoreOverrideCursor();
+    connect(tableWidget, SIGNAL(itemChanged(QTableWidgetItem *)), this, SLOT(addToEditList()));
 }
 
-void Worker::process()
+void MainWindow::on_comboBox_Table_currentIndexChanged(QString table)
 {
-    QString column = wp->getColtext();
-    QString letext = wp->getLetext();
-    QString filter = column + " like '%" + letext + "%'";
-    wp->model->setFilter(filter);
-    wp->model->select();
-    emit alldone();
+    refresh(table, "");
 }
 
 void MainWindow::search()
-{    
-    sbWindow->clearMessage();
-    WaitingSpinnerWidget* spinner = new WaitingSpinnerWidget(this);
-    spinner->setRoundness(70.0);
-    spinner->setMinimumTrailOpacity(15.0);
-    spinner->setTrailFadePercentage(70.0);
-    spinner->setNumberOfLines(12);
-    spinner->setLineLength(10);
-    spinner->setLineWidth(5);
-    spinner->setInnerRadius(10);
-    spinner->setRevolutionsPerSecond(1);
-    spinner->setColor(QColor(81, 4, 71));
-    spinner->start();
-    //QThread *th = QThread::create(query);
-    QThread *th = new QThread();
-    Worker *worker = new Worker(this);
-    worker->moveToThread(th);
-    connect(worker, SIGNAL(error(QString)), this, SLOT(errorString(QString)));
-    connect(th, SIGNAL(started()), worker, SLOT(process()));
-    connect(worker, SIGNAL(finished()), worker, SLOT(deleteLater()));
-    connect(th, SIGNAL(finished()), th, SLOT(deleteLater()));
-    connect(worker, SIGNAL(alldone()), th, SLOT(quit()));
-    th->start();
-
-    while (th->isRunning())
-    {
-        qApp->processEvents();
-        usleep(100000);
-    }
-    spinner->stop();
+{
+    QString filter = QString("from %1 where %2 like '%").arg(comboBox_Table->currentText()).arg(comboBox_column->currentText());
+    filter = filter + lineEdit->text() + "%'";
+    refresh(comboBox_Table->currentText(), filter);
 }
 
 void MainWindow::on_pbSubmit_clicked()
 {
-    model->submitAll();
+    for(int i=0;i<editList.length();i++)
+    {
+        QTableWidgetItem *item = editList[i];
+        QString colName = tableWidget->horizontalHeaderItem(item->column())->text();
+        QString primarykeyValue = tableWidget->itemAt(mapKeys.value(colName), item->row())->text();
+        QString queryStr = QString("update %1 set %2='%3' where %4='%5'").arg(comboBox_Table->currentText()).arg(colName).arg(item->text()).arg(mapKeys.key(0)).arg(primarykeyValue);
+        QSqlQuery query;
+        query.exec(queryStr);
+    }
+}
+
+void MainWindow::addToEditList()
+{
+    editList.append(tableWidget->currentItem());
 }
